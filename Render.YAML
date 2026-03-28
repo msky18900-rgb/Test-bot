@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: telegram-youtube-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: free
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false          # Set manually in Render dashboard
+      - key: ALLOWED_USER_ID
+        sync: false          # Your Telegram numeric user ID
+      - key: TOKEN_JSON
+        sync: false          # Full contents of token.json
+      - key: WEBHOOK_URL
+        sync: false          # https://<your-render-app>.onrender.com
