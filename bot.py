@@ -210,7 +210,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
+async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     auth_conv = ConversationHandler(
@@ -228,8 +228,9 @@ def main():
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
 
     logger.info("Bot started")
-    app.run_polling()
+    await app.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
