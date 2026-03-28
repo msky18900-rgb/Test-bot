@@ -2,14 +2,15 @@ import os
 import logging
 import tempfile
 import asyncio
-import threading
 import json
-from flask import Flask, request, redirect, session
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder, MessageHandler, CommandHandler,
+    ContextTypes, filters, ConversationHandler
+)
 from youtube_uploader import upload_video_with_creds
 
 logging.basicConfig(level=logging.INFO)
@@ -20,78 +21,24 @@ ALLOWED_USER_ID = 8001413907
 
 SCOPES     = ["https://www.googleapis.com/auth/youtube.upload"]
 TOKEN_FILE = "/tmp/yt_token.json"
-flask_app  = Flask(__name__)
-flask_app.secret_key = os.urandom(24)
 
-oauth_config = {}
+# Conversation states
+ASK_CLIENT_ID, ASK_CLIENT_SECRET = range(2)
 
-
-@flask_app.route("/")
-def index():
-    return "<h2>Bot is running ✅</h2><p><a href='/setup'>Set up YouTube OAuth</a></p>"
+# Temp store during conversation
+pending = {}
 
 
-@flask_app.route("/setup", methods=["GET", "POST"])
-def setup():
-    if request.method == "POST":
-        oauth_config["client_id"]     = request.form["client_id"].strip()
-        oauth_config["client_secret"] = request.form["client_secret"].strip()
-        flow = _make_flow()
-        auth_url, state = flow.authorization_url(
-            access_type="offline",
-            include_granted_scopes="true",
-            prompt="consent",
-        )
-        session["state"] = state
-        return redirect(auth_url)
-
-    return """
-    <html><body style="font-family:sans-serif;max-width:480px;margin:60px auto;padding:0 20px">
-    <h2>YouTube OAuth Setup</h2>
-    <p>Enter your Google OAuth credentials from
-    <a href="https://console.cloud.google.com/apis/credentials" target="_blank">Google Cloud Console</a>.</p>
-    <form method="POST">
-      <label>Client ID</label><br>
-      <input name="client_id" style="width:100%;padding:8px;margin:6px 0 16px;box-sizing:border-box" required><br>
-      <label>Client Secret</label><br>
-      <input name="client_secret" style="width:100%;padding:8px;margin:6px 0 16px;box-sizing:border-box" required><br>
-      <button type="submit" style="padding:10px 24px;background:#4285F4;color:white;border:none;border-radius:4px;cursor:pointer">
-        Authorize with Google
-      </button>
-    </form>
-    </body></html>
-    """
+def get_render_url():
+    return os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:10000")
 
 
-@flask_app.route("/oauth2callback")
-def oauth2callback():
-    if not oauth_config.get("client_id"):
-        return "Session expired. Please go back to /setup and try again.", 400
-
-    flow = _make_flow()
-    flow.fetch_token(authorization_response=request.url)
-    creds = flow.credentials
-
-    token_data = json.loads(creds.to_json())
-    with open(TOKEN_FILE, "w") as f:
-        json.dump(token_data, f)
-
-    return """
-    <html><body style="font-family:sans-serif;max-width:480px;margin:60px auto;padding:0 20px">
-    <h2>✅ Authorization successful!</h2>
-    <p>Your YouTube token has been saved. The bot is ready to upload videos.</p>
-    <p>Just forward any video to your Telegram bot.</p>
-    </body></html>
-    """
-
-
-def _make_flow() -> Flow:
-    render_url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:10000")
-    redirect_uri = f"{render_url}/oauth2callback"
+def make_flow(client_id, client_secret):
+    redirect_uri = f"{get_render_url()}/oauth2callback"
     client_config = {
         "web": {
-            "client_id":     oauth_config["client_id"],
-            "client_secret": oauth_config["client_secret"],
+            "client_id":     client_id,
+            "client_secret": client_secret,
             "auth_uri":      "https://accounts.google.com/o/oauth2/auth",
             "token_uri":     "https://oauth2.googleapis.com/token",
             "redirect_uris": [redirect_uri],
@@ -115,14 +62,103 @@ def load_credentials():
     return creds
 
 
+# ── /start ────────────────────────────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    render_url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:10000")
     await update.message.reply_text(
-        f"👋 Hi! Before using me, make sure YouTube is authorized.\n\n"
-        f"Set up here: {render_url}/setup\n\n"
-        f"Then forward me any video — the caption becomes the YouTube title."
+        "👋 Hi! I upload videos to your YouTube channel.\n\n"
+        "First, authorize YouTube by sending /auth\n"
+        "Then just forward me any video!"
     )
 
+
+# ── /auth conversation ────────────────────────────────────────────────────────
+
+async def auth_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER_ID:
+        await update.message.reply_text("⛔ Unauthorized.")
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "Let's connect your YouTube account.\n\n"
+        "Step 1: Go to https://console.cloud.google.com/apis/credentials\n"
+        "Find your OAuth 2.0 Client ID and paste it below 👇"
+    )
+    return ASK_CLIENT_ID
+
+
+async def got_client_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending["client_id"] = update.message.text.strip()
+    await update.message.reply_text("Got it! Now paste your Client Secret 👇")
+    return ASK_CLIENT_SECRET
+
+
+async def got_client_secret(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    client_id     = pending.get("client_id")
+    client_secret = update.message.text.strip()
+
+    pending["client_id"]     = client_id
+    pending["client_secret"] = client_secret
+
+    try:
+        flow = make_flow(client_id, client_secret)
+        auth_url, state = flow.authorization_url(
+            access_type="offline",
+            prompt="consent",
+        )
+        pending["state"] = state
+
+        # Save flow config so callback can recreate it
+        pending["flow_config"] = {
+            "client_id":     client_id,
+            "client_secret": client_secret,
+        }
+
+        await update.message.reply_text(
+            f"✅ Almost done!\n\n"
+            f"Click this link to authorize YouTube:\n{auth_url}\n\n"
+            f"After approving, paste the full redirect URL you land on back here 👇\n"
+            f"(It will start with {get_render_url()}/oauth2callback?...)"
+        )
+        return ASK_CLIENT_SECRET + 1  # reuse state slot for URL
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error building auth URL: {e}")
+        return ConversationHandler.END
+
+
+async def got_callback_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    callback_url = update.message.text.strip()
+
+    try:
+        cfg = pending.get("flow_config", {})
+        flow = make_flow(cfg["client_id"], cfg["client_secret"])
+        flow.fetch_token(authorization_response=callback_url)
+        creds = flow.credentials
+
+        token_data = json.loads(creds.to_json())
+        with open(TOKEN_FILE, "w") as f:
+            json.dump(token_data, f)
+
+        await update.message.reply_text(
+            "🎉 YouTube authorized successfully!\n\n"
+            "Now just forward me any video and I'll upload it to your channel."
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Failed to get token: {e}\n\n"
+            "Make sure you pasted the full URL from your browser after approving."
+        )
+
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+
+# ── Video handler ─────────────────────────────────────────────────────────────
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -132,9 +168,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     creds = load_credentials()
     if not creds:
-        render_url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:10000")
         await update.message.reply_text(
-            f"⚠️ YouTube not authorized yet.\nPlease visit: {render_url}/setup"
+            "⚠️ YouTube not authorized yet. Send /auth to connect."
         )
         return
 
@@ -173,20 +208,26 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(tmp_path)
 
 
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port)
-
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
-    logger.info("Flask server started")
-
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    auth_conv = ConversationHandler(
+        entry_points=[CommandHandler("auth", auth_start)],
+        states={
+            ASK_CLIENT_ID:         [MessageHandler(filters.TEXT & ~filters.COMMAND, got_client_id)],
+            ASK_CLIENT_SECRET:     [MessageHandler(filters.TEXT & ~filters.COMMAND, got_client_secret)],
+            ASK_CLIENT_SECRET + 1: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_callback_url)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(auth_conv)
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
-    logger.info("Telegram bot polling started")
+
+    logger.info("Bot started")
     app.run_polling()
 
 
