@@ -1,0 +1,8 @@
+client_secret.json
+token.json
+*.pyc
+__pycache__/
+.env
+*.mp4
+*.mov
+*.avi
