@@ -22,10 +22,8 @@ ALLOWED_USER_ID = 8001413907
 SCOPES     = ["https://www.googleapis.com/auth/youtube.upload"]
 TOKEN_FILE = "/tmp/yt_token.json"
 
-# Conversation states
-ASK_CLIENT_ID, ASK_CLIENT_SECRET = range(2)
+ASK_CLIENT_ID, ASK_CLIENT_SECRET, ASK_CALLBACK_URL = range(3)
 
-# Temp store during conversation
 pending = {}
 
 
@@ -62,17 +60,13 @@ def load_credentials():
     return creds
 
 
-# ── /start ────────────────────────────────────────────────────────────────────
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Hi! I upload videos to your YouTube channel.\n\n"
-        "First, authorize YouTube by sending /auth\n"
+        "First authorize YouTube by sending /auth\n"
         "Then just forward me any video!"
     )
 
-
-# ── /auth conversation ────────────────────────────────────────────────────────
 
 async def auth_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID:
@@ -81,7 +75,7 @@ async def auth_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "Let's connect your YouTube account.\n\n"
-        "Step 1: Go to https://console.cloud.google.com/apis/credentials\n"
+        "Go to https://console.cloud.google.com/apis/credentials\n\n"
         "Find your OAuth 2.0 Client ID and paste it below 👇"
     )
     return ASK_CLIENT_ID
@@ -94,36 +88,23 @@ async def got_client_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def got_client_secret(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    client_id     = pending.get("client_id")
-    client_secret = update.message.text.strip()
-
-    pending["client_id"]     = client_id
-    pending["client_secret"] = client_secret
+    pending["client_secret"] = update.message.text.strip()
 
     try:
-        flow = make_flow(client_id, client_secret)
-        auth_url, state = flow.authorization_url(
+        flow = make_flow(pending["client_id"], pending["client_secret"])
+        auth_url, _ = flow.authorization_url(
             access_type="offline",
             prompt="consent",
         )
-        pending["state"] = state
-
-        # Save flow config so callback can recreate it
-        pending["flow_config"] = {
-            "client_id":     client_id,
-            "client_secret": client_secret,
-        }
-
         await update.message.reply_text(
-            f"✅ Almost done!\n\n"
-            f"Click this link to authorize YouTube:\n{auth_url}\n\n"
-            f"After approving, paste the full redirect URL you land on back here 👇\n"
-            f"(It will start with {get_render_url()}/oauth2callback?...)"
+            f"✅ Click this link to authorize YouTube:\n\n{auth_url}\n\n"
+            f"After approving, your browser will show an error page — that's normal!\n"
+            f"Copy the full URL from your browser's address bar and paste it here 👇"
         )
-        return ASK_CLIENT_SECRET + 1  # reuse state slot for URL
+        return ASK_CALLBACK_URL
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Error building auth URL: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
         return ConversationHandler.END
 
 
@@ -131,23 +112,21 @@ async def got_callback_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     callback_url = update.message.text.strip()
 
     try:
-        cfg = pending.get("flow_config", {})
-        flow = make_flow(cfg["client_id"], cfg["client_secret"])
+        flow = make_flow(pending["client_id"], pending["client_secret"])
         flow.fetch_token(authorization_response=callback_url)
         creds = flow.credentials
 
-        token_data = json.loads(creds.to_json())
         with open(TOKEN_FILE, "w") as f:
-            json.dump(token_data, f)
+            f.write(creds.to_json())
 
         await update.message.reply_text(
             "🎉 YouTube authorized successfully!\n\n"
-            "Now just forward me any video and I'll upload it to your channel."
+            "Now forward me any video and I'll upload it to your channel."
         )
     except Exception as e:
         await update.message.reply_text(
-            f"❌ Failed to get token: {e}\n\n"
-            "Make sure you pasted the full URL from your browser after approving."
+            f"❌ Failed: {e}\n\n"
+            "Make sure you copied the full URL from your browser."
         )
 
     return ConversationHandler.END
@@ -157,8 +136,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
-
-# ── Video handler ─────────────────────────────────────────────────────────────
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -208,17 +185,15 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(tmp_path)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-async def main():
+def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     auth_conv = ConversationHandler(
         entry_points=[CommandHandler("auth", auth_start)],
         states={
-            ASK_CLIENT_ID:         [MessageHandler(filters.TEXT & ~filters.COMMAND, got_client_id)],
-            ASK_CLIENT_SECRET:     [MessageHandler(filters.TEXT & ~filters.COMMAND, got_client_secret)],
-            ASK_CLIENT_SECRET + 1: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_callback_url)],
+            ASK_CLIENT_ID:     [MessageHandler(filters.TEXT & ~filters.COMMAND, got_client_id)],
+            ASK_CLIENT_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_client_secret)],
+            ASK_CALLBACK_URL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, got_callback_url)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -228,9 +203,8 @@ async def main():
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
 
     logger.info("Bot started")
-    await app.run_polling()
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
