@@ -9,8 +9,8 @@ from youtube_uploader import upload_video
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
+TELEGRAM_TOKEN = os.environ["8646298365:AAH95QvkjsTBW-IT78vvTxrSYqLpFQjWvTs"]
+ALLOWED_USER_ID = int(os.environ["8001413907"])
 
 
 async def post_init(application):
